@@ -1,0 +1,846 @@
+from utils import eprint
+
+_conf = {}
+
+# TODO: Use configuration file
+_conf['chat_names'] = {
+    # 669174061: 'admin'
+}
+
+def get(conf_opt):
+    # TODO: Use configuration file
+    if conf_opt == 'admin_chat_id':
+        return None
+
+    conf_item =_conf[conf_opt]
+    if conf_item != None:
+        return conf_item
+    else:
+        eprint(f'Error: no {conf_opt} provided in configuration file')
+        return None
+from typing import List, NewType, Callable
+
+from mex.utils import eprint, remove_common_prefix
+import mex.dotted_dict as dotkey
+from mex.val import *
+
+#########
+# Types #
+#########
+
+Scope = NewType("Scope", List[str])
+Path = NewType("Path", str)
+
+####################
+# Helper Functions #
+####################
+
+def flatten_dict(init, lkey='', separator='.', key_mask=lambda e: e):
+    ret = {}
+    for rkey,val in init.items():
+        key = lkey + rkey
+
+        if isinstance(val, dict) and not key_mask(key):
+            ret.update(flatten_dict(val, key + separator))
+        else:
+            ret[key] = val
+    return ret
+
+def scopify(dotted_str):
+    return dotted_str.split('.')
+
+def add_scope(scope: Scope, s: Path) -> Path:
+    if len(s) == 0:
+        return '.'.join(scope)
+
+    if len(scope) == 0:
+        return s
+
+    return '.'.join(scope) + '.' + s
+
+def add_scope_rel(scope: Scope, s, starting_path):
+    abs_s = scopify(add_scope(scope, s))
+
+    rel_s, nic = tuple(map(list, remove_common_prefix(abs_s, scopify(starting_path)))) # nic: not in common
+
+    lvs_to_go_back = len(nic)
+    rel_pre = ['<..>'] * lvs_to_go_back
+    rel_s = add_scope(rel_pre, '.'.join(rel_s))
+
+    return rel_s
+
+def expand_path(scope: Scope, path) -> Path:
+    if len(path) == 0:
+        return path
+
+    if path[0] == '.':
+        return add_scope(scope, path[1:])
+
+    return path
+
+##################
+# Helper Classes #
+##################
+
+class TravConf:
+    trav_map: Callable
+
+    def __init__(self, trav_map):
+        self.trav_map = trav_map
+
+#################
+# Context class #
+#################
+
+class Context:
+    ret = None
+
+    scope: Scope
+    env = {}
+    cur_item = None
+
+    def __init__(self, cur_item, scope=[], env={}, cached_exps={}):
+        self.scope = scope
+        self.env = env
+        self.cached_exps = cached_exps
+        self.cur_item = cur_item
+
+    def _tree(self, root_path, tcfg: TravConf):
+        root_path = expand_path(self.scope, root_path)
+
+        root = dotkey.get(self.env, root_path)
+
+        if not root:
+            return {}
+
+        # TODO: Figure this out (NB. Currently only works with '.' as root_path)
+        # cur_item_rel2root = expand_path_rel(self.cur_item, root_path)
+        cur_item_rel2root = self.cur_item.split('.')[-1]
+        ret = { 
+            k: v for (k, v)
+            in map(
+                tcfg.trav_map,
+                map(
+                    lambda x: (x[0], x[1].eval(x[0], scopify(root_path))),
+                    root.items()
+                )
+            )
+        }
+        dotkey.pop(ret, cur_item_rel2root)
+
+        return ret
+
+    def _trav_flags(raw=1):
+        trav_map = lambda x: x
+
+        if raw == 1:
+            # TODO: Use composition
+            trav_map = lambda p: (p[0], p[1].raw())
+
+            # This sickens me...
+            # trav_map_res = lambda x: [ (p[0][0], p[0][1].raw())
+            #     for p in [trav_map(x)]
+            # ]
+
+        return TravConf(
+            trav_map
+        )
+
+    def tree(self, root_path, **kwargs):
+        return self._tree(root_path, Context._trav_flags(**kwargs))
+
+    def vtree(self, root_path, **kwargs):
+        return list(flatten_dict(self.tree(root_path, **kwargs)).values())
+import redis
+
+r = redis.Redis()
+r.mset({'nome': 'Francesco', 'nome2': 'Come Stai'})
+import fire
+from bs4 import BeautifulSoup
+import urllib
+from urllib.request import urlopen, urlretrieve
+import sys
+from sys import stderr
+from pathlib import Path
+
+def last_subpath(path):
+    return path.split('/')[-1].strip()
+
+def dl_until_size(links_file, max_tot_size_mb, target='.'):
+    target = Path(target)
+
+    def clean_link_contents(contents):
+        # return '\n'.join(filter(
+        #     lambda line: not line.isspace(),
+        #     contents.split('\n')
+        # ))
+
+        # TODO: Transform tabs into spaces
+        return contents
+
+    with open(links_file) as f:
+        links = f.readlines()
+
+    total_size = 0
+    for idx, link in enumerate(links):
+        if total_size >= max_tot_size_mb * 1024 * 1024:
+            break
+
+        # TODO: Look inside zips
+        if '.zip' in link:
+            continue
+
+        dl_file_name = f'{idx}-{last_subpath(link)}'
+        with open(target / Path(dl_file_name), 'w') as f:
+            print(f'Downloading {link} in {dl_file_name}', file=stderr)
+
+            link_contents = urlopen(links[0]).read().decode('utf-8')
+
+            link_contents = clean_link_contents(link_contents)
+
+            dl_size = sys.getsizeof(link_contents)
+            total_size += dl_size
+
+            print(f'Download finished; size: {dl_size}B; tot: {total_size}B', file=stderr)
+
+            f.write(link_contents)
+
+    print(f'All downloads finished; tot: {total_size / 1024 / 1024}MB', file=stderr)
+
+def cli():
+    fire.Fire(dl_until_size)
+def insert(d, s, val, err_on_present = False):
+    splt_s = s.split('.', 1)
+    topkey = splt_s[0]
+    rest = splt_s[1] if len(splt_s) == 2 else None
+
+    if rest:
+        if not d.get(topkey, None):
+            d[topkey] = {}
+        insert(d[topkey], rest, val, err_on_present)
+    else:
+        # TODO: Check for duplicates
+        d[topkey] = val
+
+def get(d, s):
+    # Empty path is root of dict
+    if len(s) == 0:
+        return d
+
+    splt_s = s.split('.', 1)
+    topkey = splt_s[0]
+    rest = splt_s[1] if len(splt_s) == 2 else None
+
+    if rest == None:
+        return d.get(topkey, None)
+    elif not d.get(topkey, None):
+        return None
+    else:
+        return get(d[topkey], rest)
+
+def pop(d, k):
+    splt_k = k.split('.', 1)
+    topkey = splt_k[0]
+    rest = splt_k[1] if len(splt_k) == 2 else None
+
+    if rest:
+        if not d.get(topkey, None):
+            return None
+        pop(d[topkey], rest)
+    else:
+        # TODO: Check for duplicates
+        return d.pop(topkey)
+import fire
+from bs4 import BeautifulSoup
+import urllib
+from urllib.request import Request, urlopen
+import re
+from operator import iconcat
+from itertools import chain
+
+def get_all_links(url):
+    soup = BeautifulSoup(
+        urlopen(Request(url)),
+        'lxml'
+    )
+
+    try:
+        return list(map(
+            lambda x: re.sub(r'\s', '+', str(x.get('href'))),
+            soup.find_all('a')
+        ))
+
+    except urllib.error.HTTPError as err:
+        print(f'{err} [{err.geturl()}]')
+
+def walk_ftp_links(
+        root_link,
+        step,
+        leaves_only = False,
+        pred = lambda _: True
+):
+    results = []
+    for link in get_all_links(root_link):
+        full_link = root_link + link
+
+        if link != '/' and not link.startswith('/ftp/') and not link.startswith('?') and link[-1] == '/':
+            if not leaves_only and pred(full_link):
+                results.append(step(full_link))
+
+            results += walk_ftp_links(full_link, step, leaves_only, pred)
+
+        else:
+            if pred(full_link):
+                results.append(step(full_link))
+
+    return results
+
+def get_all_ly_links(mutopia_homepage='https://www.mutopiaproject.org/ftp/'):
+    soup = BeautifulSoup(
+        urlopen(Request(mutopia_homepage))
+    )
+
+    ly_file_links = walk_ftp_links(
+        leaves_only = True,
+        pred = lambda lnk: '.ly' in lnk or '-ly' in lnk,
+        step = print,
+        root_link = mutopia_homepage
+    )
+
+def cli():
+    fire.Fire(get_all_ly_links)
+import telegram
+from telegram.ext import Updater
+from telegram.ext import CommandHandler, MessageHandler
+from telegram.ext import Filters
+from pathlib import Path
+import time
+import sys
+
+import utils
+from utils import eprint, SRC_PATH, unique_file_path
+
+import register
+from register import RegChats
+
+################################
+# Get access to bot with token #
+################################
+
+utils.wait_until_connected(delay=20, trace=True)
+updater = Updater(token='1612200159:AAFxo3qDQG2AWSmP6pvbrlzYw4cUtDrTpCM', use_context=True)
+dispatcher = updater.dispatcher
+
+##############
+# Parse args #
+##############
+
+if len(sys.argv) != 2:
+    eprint('Usage: python main.py DL_ROOT_DIR')
+    exit(1)
+
+DL_ROOT_DIR = Path(sys.argv[1])
+DL_SUBDIR = Path('.')
+
+##################################
+# Helper Functions ans Constants #
+##################################
+
+def cur_time():
+    return time.strftime("%H:%M:%S", time.localtime())
+
+def intro(txt, silent = False):
+    regchats = RegChats.get()
+
+    for chat_id in RegChats.get():
+        updater.bot.send_message(
+            chat_id = chat_id,
+            text = txt,
+            disable_notification = silent
+        )
+
+#############
+# Bot Intro #
+#############
+
+intro('NotesBoy is awake')
+
+############
+# Handlers #
+############
+
+dispatcher.add_handler(
+    CommandHandler(
+        'hello',
+        lambda upd, ctx: ctx.bot.send_message(
+            chat_id = upd.effective_chat.id,
+            text = "Hello there"
+        )
+    )
+)
+
+dispatcher.add_handler(
+    CommandHandler(
+        'register',
+        register.handler
+    )
+)
+
+dispatcher.add_handler(
+    CommandHandler(
+        'regcommit',
+        register.commit
+    )
+)
+
+def download_photo(upd, ctx):
+    global DL_ROOT_DIR
+    global DL_SUBDIR
+
+    dl_path = unique_file_path(
+        DL_ROOT_DIR / DL_SUBDIR,
+        fstr = '{}.jpg'
+    )
+
+    print(f'Downloading to {dl_path}')
+
+    ctx.bot.get_file(
+        upd.message.photo[-1].file_id
+    ).download(dl_path)
+
+dispatcher.add_handler(
+    MessageHandler(
+        Filters.photo,
+        download_photo
+    )
+)
+
+def change_subdir(upd, ctx):
+    global DL_ROOT_DIR
+    global DL_SUBDIR
+
+    DL_SUBDIR = Path(ctx.args[0])
+
+    ctx.bot.send_message(
+        chat_id = upd.effective_chat.id,
+        text = f'Updating download dir to {DL_ROOT_DIR / DL_SUBDIR}'
+    )
+dispatcher.add_handler(
+    CommandHandler(
+        'sub',
+        change_subdir
+    )
+)
+
+########
+# Main #
+########
+
+# Start bot
+updater.start_polling()
+import time
+
+from utils import *
+import conf
+
+###########
+# Globals #
+###########
+
+registered_chats = set()
+
+####################
+# Server Interface #
+####################
+
+def stop_server():
+    shell('minecraftd stop')
+    shell('systemctl stop logmein-hamachi')
+
+def start_server():
+    shell('systemctl start logmein-hamachi')
+    shell('minecraftd start')
+
+def get_server_status_desc():
+    return shell('minecraftd status').decode('utf-8')
+
+def get_players_num():
+    """Get number of playing players, returns None when server is down"""
+
+    list_cmd_stdout = shell('minecraftd command list').decode('utf-8')
+
+    # One line (plus a blank one at the end...) means server is down
+    if len(list_cmd_stdout.split('\n')) == 2:
+        return None
+
+    # Get num of players in 2nd line, 4th ':' section, 3rd word
+    return int(
+        list_cmd_stdout
+            .split('\n')[1]
+            .split(':')[3]
+            .split()[2]
+    )
+
+################
+# Bot Services #
+################
+
+def minecraft_handler(upd, ctx):
+    # Utilities
+    def send_txt(txt, trace=False):
+        chat_id = upd.effective_chat.id
+
+        if trace:
+            chat_name = conf.get('chat_names').get(chat_id, chat_id)
+            print(f'mc_handler(id={chat_name}): {txt}')
+
+        ctx.bot.send_message(
+            chat_id = chat_id,
+            text = txt
+        )
+
+    # Add chat to minecraft chats to that it gets notified of minecraft things
+    registered_chats.add(upd.effective_chat)
+
+    # Parse command
+    USG_MSG = """
+    Usage: minecraft (stop|start)
+    Or: minecraft cmd SERVER_CMD [ARGS...]"""
+
+    if len(ctx.args) < 1:
+        send_txt(USG_MSG)
+        return
+
+    # Parse subcmd
+    subcmd = ctx.args[0]
+
+    if subcmd == 'start':
+        start_server()
+        send_txt('Server started', trace=True)
+
+    elif subcmd == 'stop':
+        send_txt('Stopping server...', trace=True)
+        stop_server()
+        send_txt('Server stopped', trace=True)
+
+    elif subcmd == 'status':
+        send_txt(get_server_status_desc())
+
+    elif subcmd == 'cmd':
+        minecraft_cmd = ' '.join(ctx.args[1:])
+
+        stdout = shell(f'minecraftd command {minecraft_cmd}').decode('utf-8')
+
+        send_txt(stdout, trace=True)
+
+    else:
+        send_txt(USG_MSG)
+        return
+
+def server_inactivity_checker(bot):
+    def log(txt, silent=False, notify=True):
+        print(f'mc_inactivity_checker: {txt}')
+
+        if not silent:
+            for chat in registered_chats:
+                bot.send_message(
+                    chat_id = chat.id,
+                    text = txt,
+                    disable_notification = not notify
+                )
+
+    def service():
+        while True:
+            # Sleep before check
+            time.sleep(60 * 60 * 0.5)
+
+            # Do check
+            check_time = time.strftime("%H:%M:%S", time.localtime())
+
+            players_num = get_players_num()
+
+            # Don't do anything if the server is down
+            if players_num == None:
+                log(f'Skipping inactivity check; server is down', silent=True)
+                continue
+
+            log(f'Player inactivity check (time: {check_time}, pls_num: {players_num})', notify=False)
+
+            if players_num == 0:
+                log(f'Stopping minecraft server due to inactivity')
+                stop_server()
+            else:
+                log(f'Check passed', silent=True)
+
+    return service
+from pathlib import Path
+
+from utils import SRC_PATH
+
+REGCHATS_FILE_PATH = SRC_PATH / Path('registered_chats')
+
+# TODO: Find out why duplicates exist
+class RegChats:
+    val = None
+
+    def parse_regchats():
+        content = []
+        if REGCHATS_FILE_PATH.exists():
+            with open(REGCHATS_FILE_PATH, 'r') as f:
+                content = f.readlines()
+
+        return set([ ln.strip() for ln in content ])
+
+    def init():
+        if RegChats.val == None:
+            RegChats.val = RegChats.parse_regchats()
+
+    def get():
+        RegChats.init()
+        return RegChats.val
+
+    def add(chat_id):
+        RegChats.init()
+        RegChats.val.add(chat_id)
+
+def handler(upd, ctx):
+    RegChats.add(upd.effective_chat.id)
+    ctx.bot.send_message(
+        chat_id = upd.effective_chat.id,
+        text = 'Chat registered'
+    )
+
+def commit(upd, ctx):
+    regchats_path = SRC_PATH / Path('registered_chats')
+
+    if regchats_path.exists():
+        regchats_path.unlink()
+
+    with open(regchats_path, 'w') as f:
+        for i in RegChats.val:
+            print(i, file=f)
+import fire
+import re
+from sys import stderr
+from cardinality import count
+
+# TODO: zips_always_come_first = False
+def remove_expanded_zips(links_file, zips_always_come_first=True):
+    with open(links_file, 'r') as f:
+        links = f.readlines()
+
+    if not zips_always_come_first:
+        assert False, "Not implemented yet"
+
+    zip_link_re = re.compile(r'^(.*?)\.zip$')
+    subpaths_re = re.compile(r'(.*?)\/')
+
+    zip_folder_links = set()
+    for link in links:
+        print(f'Processing {link}', file=stderr) # DB
+
+        if m := zip_link_re.match(link):
+            print(f'Zip match: {link}', file=stderr) # DB
+
+            sublink = m.group(1)
+            zip_folder_links.add(sublink)
+
+            print(link, end='')
+
+        else:
+            is_zip_folder_link = count(filter(
+                lambda zfl: zfl in link,
+                zip_folder_links
+            )) >= 1
+
+            if not is_zip_folder_link:
+                print(link, end='')
+
+def cli():
+    fire.Fire(remove_expanded_zips)
+from telegram import Update, Message, Chat, MessageEntity
+from telegram.ext import Updater
+from telegram.ext import CommandHandler 
+import sys
+
+import conf
+# from main import updater
+from utils import eprint
+
+################################
+# Get access to bot with token #
+################################
+
+# updater = Updater(token='1516509922:AAHd36t-69qu1FolhavdCo6_qb_UJnFPix4', use_context=True)
+
+# updater.bot.send_message(
+#     chat_id = conf.get('admin_chat_id'),
+#     text = '/insult'
+# )
+
+updater.dispatcher.process_update(
+    Update(
+        update_id = 0,
+        message = Message(
+            message_id = 0,
+            date = datetime.now(),
+            chat = Chat(
+                id = conf.get('admin_chat_id'),
+                type = '???'
+            ),
+            entities = [
+                MessageEntity(
+                )
+            ]
+        )
+    )
+)
+
+from collections import defaultdict
+import re
+from typing import Dict, List
+from pathlib import Path
+import emoji
+
+from utils import eprint
+
+def parse_tierlist(tierlist: List[str]) -> Dict[str, str]: 
+    tier_re = re.compile(r'^##\s*(.*)$')
+    card_re = re.compile(r'^-\s*(.*)$')
+
+    result = {}
+    curr_tier = "N/A"
+    lnum = 1
+    for line in tierlist:
+        line = line.strip()
+
+        if m := tier_re.match(line):
+            tier = m.group(1)
+
+            curr_tier = tier
+
+            lnum = 1
+
+        elif m := card_re.match(line):
+            card = m.group(1)
+
+            tier_num = ""
+            if curr_tier == "Garbage":
+                tier_num = ' ' + emoji.emojize(':hankey: ' * lnum)
+            else:
+                tier_num = str(lnum)
+            result[card.lower()] = curr_tier + tier_num
+
+            lnum += 1
+
+        else:
+            eprint("{}".format(line))
+
+    return result
+
+def get_timon_tierlist():
+    if not get_timon_tierlist.cache:
+        tierlist = Path("timon-tier-list.md").read_text()
+        get_timon_tierlist.cache = parse_tierlist(tierlist.split('\n'))
+
+    return get_timon_tierlist.cache
+get_timon_tierlist.cache = None
+
+def get_tier(card):
+    return get_timon_tierlist().get(card.lower(), 'N/A')
+import sys
+import subprocess
+from pathlib import Path
+import os
+from inspect import getsourcefile
+import time
+
+SRC_PATH = Path(os.path.abspath(getsourcefile(lambda:0))).parent
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def shell(*args):
+    return subprocess.check_output(*args, shell=True)
+
+def wait_until_connected(delay, trace=False):
+    import urllib.request
+
+    def try_connect(host='http://google.com'):
+        try:
+            urllib.request.urlopen(host) #Python 3.x
+            return True
+        except:
+            return False
+
+    while True:
+        if try_connect():
+            print('Connection successful!')
+            return
+        else:
+            print(f'Connection failed... checking again in {delay}s')
+            time.sleep(delay)
+
+def unique_file_path(parent_dir, fstr='{}'):
+    if not parent_dir.is_dir():
+        return None
+
+    j = 0
+    while True:
+        name = '{}-{}'.format(
+            time.strftime('%Y-%m-%d', time.localtime()),
+            j
+        )
+        name = fstr.format(name)
+        path = parent_dir / Path(name)
+        if not path.is_file():
+            return path
+        else:
+            j += 1
+            continue
+
+from enum import Enum
+
+from mex.utils import eprint
+
+class ValType(Enum):
+    LITERAL = 1
+    EXPR = 2
+    ERROR = 3
+
+class Val:
+    def __str__(self):
+        if self.valType == ValType.ERROR:
+            return "Error({})".format(self.val)
+        else:
+            return str(self.val)
+
+    def __init__(self, valType, val):
+        self.valType = valType
+        self.val = val
+
+    def Lit(val):
+        # TODO: Don't parse only number literals
+        if isinstance(val, str) and val.replace('.', '', 1).isdigit():
+            val = float(val)
+
+        return Val(ValType.LITERAL, val)
+
+    def Nil():
+        return Val.Lit(None)
+
+    def raw(self):
+        if self.valType == ValType.ERROR:
+            return "RawError({})".format(self.val)
+        else:
+            return self.val
+
+    def eval(self, key, scope):
+        if self.valType == ValType.ERROR or self.valType == ValType.LITERAL:
+            return self
+        elif self.valType == ValType.EXPR:
+            import mex.main
+            return mex.main.do_eval_interpolation(key, self.val, scope)
+        else:
+            assert False, "Illegal branch"
+
